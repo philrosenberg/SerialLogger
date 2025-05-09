@@ -8,6 +8,54 @@
 #include<deque>
 #include<thread>
 
+//this class is a fifo buffer. It can cope with one thread pushing and one
+//thread popping, in that it won't cause a crash. No resize is possible as this
+//would break multithreading. If then end overtakes the begin then the first
+//loop of data will be lost and the fifo will think is is just a few elements
+//long. You should check size is non-zero before popping
+template<class T>
+class Fifo
+{
+public:
+    Fifo(size_t size)
+        :m_buffer(size)
+    {
+        m_begin = m_buffer.begin();
+        m_end = m_buffer.end();
+    }
+    void push_back(const T& val)
+    {
+        *m_end = val;
+        increment(m_end);
+    }
+    T pop_front()
+    {
+        typename std::vector<T>::iterator pointerToReturn = m_begin;
+        increment(m_begin);
+        return *pointerToReturn;
+    }
+    size_t size() const
+    {
+        //freeze the pointers we will use in case of multithreading
+        typename std::vector<T>::iterator begin = m_begin;
+        typename std::vector<T>::iterator end = m_end;
+        if (end >= begin)
+            return size_t(end - begin);
+        return size_t((m_buffer.end() - end) + (begin - m_buffer.begin()));
+
+    }
+private:
+    void increment(typename std::vector<T>::iterator& iter)
+    {
+        ++iter;
+        if (iter == m_buffer.end())
+            iter = m_buffer.begin();
+    }
+    std::vector<T> m_buffer;
+    typename std::vector<T>::iterator m_begin;
+    typename std::vector<T>::iterator m_end;
+};
+
 const char lineEnd[2] = { 13,10 };
 
 void throwWindowsError(std::string str)
@@ -18,7 +66,8 @@ void throwWindowsError(std::string str)
     throw(str + " " + WinError.str());
 }
 
-void readData(HANDLE hComm, std::wstring filename, size_t linesPerTimeRecord)
+
+void readData(HANDLE hComm, std::wstring filename, Fifo<unsigned char> dataBuffer, size_t linesPerTimeRecord)
 {
     size_t linesSinceLastTimeRecord = 0;
     FILETIME timeRecord{ 0,0 };
@@ -36,6 +85,7 @@ void readData(HANDLE hComm, std::wstring filename, size_t linesPerTimeRecord)
 
     unsigned char singleByte;
     bool getTimestampAtNextByte = true;
+    std::ostringstream timeStream;
     while (1)
     {
         DWORD nRead;
@@ -44,9 +94,16 @@ void readData(HANDLE hComm, std::wstring filename, size_t linesPerTimeRecord)
             if (getTimestampAtNextByte)
             {
                 GetSystemTimePreciseAsFileTime(&timeRecord);
+
                 std::cout << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
                 fout << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
                 fout.flush();//this seems like a good time to flush the file buffer
+
+                timeStream << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
+                for (char& c : timeStream.str())
+                    dataBuffer.push_back((unsigned char)c);
+                timeStream.str() = "";
+
                 linesSinceLastTimeRecord = 0;
             }
 
@@ -63,6 +120,7 @@ void readData(HANDLE hComm, std::wstring filename, size_t linesPerTimeRecord)
             std::cout.write((char*)&singleByte, 1);
 #endif
             fout.write((char*)&singleByte, 1);
+            dataBuffer.push_back(singleByte);
         }
     }
 }
@@ -177,7 +235,10 @@ int wmain( int argc, wchar_t *argv[])
         std::cout << "Extra Timeout interval per write command (ms)(ms):" << timeouts.WriteTotalTimeoutConstant << std::endl;
         std::cout << std::endl;
 
-        readData(hComm, filename, linesPerTimeRecord);
+
+        Fifo<unsigned char> dataBuffer(10 * 1024 * 1024); //10 MB
+
+        readData(hComm, filename, dataBuffer, linesPerTimeRecord);
     }
     catch (std::string err)
     {
