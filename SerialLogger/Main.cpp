@@ -1,12 +1,13 @@
+#define NOMINMAX
 #include<windows.h>
 #include<stdio.h>
 #include<iostream>
 #include<string>
 #include<sstream>
 #include<fstream>
-#include<svector/time.h>
-#include<svector/Units.h>
-#include<svector/sstring.h>
+#include<scieng/time.h>
+#include<scieng/Units.h>
+#include<scieng/unicode.h>
 #include<deque>
 #include<thread>
 #include<conio.h>
@@ -73,7 +74,7 @@ void writeData(std::wstring folder, std::wstring filenameBase, Fifo<unsigned cha
 {
     std::wostringstream filename;
     size_t fileNumber = 0;
-    std::wstring dateString = sci::nativeUnicode(sci::utf8ToUtf16(sci::UtcTime::now().getIso8601String(0, true, true, true)));
+    std::wstring dateString = sci::toNativeUnicode(sci::UtcTime::now().getIso8601String(0, true, true, true));
     filename << folder << dateString << L"_" << std::setw(10) << std::setfill(L'0') << fileNumber << filenameBase;
     std::fstream fout;
     fout.open(filename.str(), std::ios::out);
