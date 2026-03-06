@@ -5,14 +5,17 @@
 #include<sstream>
 #include<fstream>
 #include<svector/time.h>
+#include<svector/Units.h>
+#include<svector/sstring.h>
 #include<deque>
 #include<thread>
+#include<conio.h>
 
 //this class is a fifo buffer. It can cope with one thread pushing and one
-//thread popping, in that it won't cause a crash. No resize is possible as this
-//would break multithreading. If then end overtakes the begin then the first
+//thread popping, in that it won't cause a race. No resize is possible as this
+//would break multithreading. If the end overtakes the begin then the first
 //loop of data will be lost and the fifo will think is is just a few elements
-//long. You should check size is non-zero before popping
+//long. You must check size is non-zero before popping
 template<class T>
 class Fifo
 {
@@ -21,7 +24,7 @@ public:
         :m_buffer(size)
     {
         m_begin = m_buffer.begin();
-        m_end = m_buffer.end();
+        m_end = m_buffer.begin();
     }
     void push_back(const T& val)
     {
@@ -66,15 +69,14 @@ void throwWindowsError(std::string str)
     throw(str + " " + WinError.str());
 }
 
-
-void readData(HANDLE hComm, std::wstring filename, Fifo<unsigned char> dataBuffer, size_t linesPerTimeRecord)
+void writeData(std::wstring folder, std::wstring filenameBase, Fifo<unsigned char> *dataBuffer, size_t linesPerFile, bool outputToScreen, bool *stop)
 {
-    size_t linesSinceLastTimeRecord = 0;
-    FILETIME timeRecord{ 0,0 };
-
-    sci::UtcTime begin = sci::UtcTime::now();
+    std::wostringstream filename;
+    size_t fileNumber = 0;
+    std::wstring dateString = sci::nativeUnicode(sci::utf8ToUtf16(sci::UtcTime::now().getIso8601String(0, true, true, true)));
+    filename << folder << dateString << L"_" << std::setw(10) << std::setfill(L'0') << fileNumber << filenameBase;
     std::fstream fout;
-    fout.open(filename, std::ios::out);
+    fout.open(filename.str(), std::ios::out);
     if (!fout.is_open())
     {
         std::cout << "Failed to open data file." << std::endl;
@@ -84,9 +86,48 @@ void readData(HANDLE hComm, std::wstring filename, Fifo<unsigned char> dataBuffe
     fout << lineEnd;
 
     unsigned char singleByte;
+    size_t lineNumber = 0;
+    while (dataBuffer->size() > 0 || !(*stop)) //run until told to stop and the buffer is emptied
+    {
+        if (dataBuffer->size() > 0)
+        {
+            singleByte = dataBuffer->pop_front();
+            fout.write((char*)&singleByte, 1);
+            if (outputToScreen)
+                std::cout.write((char*)&singleByte, 1);
+            if (singleByte == 0x0d)
+            {
+                ++lineNumber;
+                if (lineNumber == linesPerFile)
+                {
+                    lineNumber = 0;
+                    ++fileNumber;
+                    fout.close();
+                    fout.clear();
+                    filename.str(L"");
+                    filename.clear();
+                    filename << folder << dateString << L"_" << std::setw(10) << std::setfill(L'0') << fileNumber << filenameBase;
+                    fout.open(filename.str(), std::ios::out);
+                }
+            }
+        }
+        else
+            fout.flush();//if we have nothing else to do we may as well flush the buffer
+    }
+}
+
+
+void readData(HANDLE hComm, Fifo<unsigned char> *dataBuffer, size_t linesPerTimeRecord, bool writeTimestampsToScreen, bool* stop)
+{
+    size_t linesSinceLastTimeRecord = 0;
+    FILETIME timeRecord{ 0,0 };
+
+    sci::UtcTime begin = sci::UtcTime::now();
+
+    unsigned char singleByte;
     bool getTimestampAtNextByte = true;
     std::ostringstream timeStream;
-    while (1)
+    while (!(*stop))
     {
         DWORD nRead;
         if (ReadFile(hComm, &singleByte, 1, &nRead, NULL) && nRead == 1)
@@ -95,14 +136,16 @@ void readData(HANDLE hComm, std::wstring filename, Fifo<unsigned char> dataBuffe
             {
                 GetSystemTimePreciseAsFileTime(&timeRecord);
 
-                std::cout << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
-                fout << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
-                fout.flush();//this seems like a good time to flush the file buffer
-
                 timeStream << "tr " << timeRecord.dwHighDateTime << " " << timeRecord.dwLowDateTime << "\n";
+
                 for (char& c : timeStream.str())
-                    dataBuffer.push_back((unsigned char)c);
-                timeStream.str() = "";
+                    dataBuffer->push_back((unsigned char)c);
+
+                if (writeTimestampsToScreen)
+                    std::cout << timeStream.str();
+
+                timeStream.str("");
+                timeStream.clear();
 
                 linesSinceLastTimeRecord = 0;
             }
@@ -116,11 +159,14 @@ void readData(HANDLE hComm, std::wstring filename, Fifo<unsigned char> dataBuffe
                 getTimestampAtNextByte = false;
 
             //output the data
-#ifdef _DEBUG
-            std::cout.write((char*)&singleByte, 1);
-#endif
-            fout.write((char*)&singleByte, 1);
-            dataBuffer.push_back(singleByte);
+            dataBuffer->push_back(singleByte);
+            if (writeTimestampsToScreen && linesSinceLastTimeRecord == 0)
+            {
+                if (singleByte == 0x0d)
+                    std::cout << "\n";
+                else
+                    std::cout.write((char*)(&singleByte), 1);
+            }
         }
     }
 }
@@ -142,19 +188,33 @@ std::string parityDescription(BYTE parity)
 
 int wmain( int argc, wchar_t *argv[])
 {
-    if (argc != 4)
+
+    std::wstring comport;
+    std::wstring filename = L"C:\\Temp\\serialDataTemp.txt";
+    size_t linesPerTimeRecord = size_t(-1);
+    bool outputToScreen = true;
+    if (argc == 2)
+    {
+        std::wstring comport = L"\\\\.\\" + std::wstring(argv[1]);
+    }
+    else if (argc == 4)
+    {
+        comport = L"\\\\.\\" + std::wstring(argv[1]);
+        filename = argv[2];
+        outputToScreen = false;
+
+        wchar_t* end = nullptr;
+        linesPerTimeRecord = std::wcstoul(argv[3], &end, 10);
+        if (end == argv[3])
+        {
+            std::wcout << "could not convert the third argument to an integer" << std::endl;
+            return 1;
+        }
+    }
+    else
     {
         std::cout << "please enter com port and filename and lines per time record as arguments, e.g.\nSerialLogger COM4 \"C:\\Data\\my file.txt\" 400";
-        return 1;
-    }
-    std::wstring comport = L"\\\\.\\" + std::wstring(argv[1]);
-    std::wstring filename = argv[2];
-
-    wchar_t* end = nullptr;
-    size_t linesPerTimeRecord = std::wcstoul(argv[3], &end, 10);
-    if (end == argv[3])
-    {
-        std::wcout << "could not convert the third argument to an integer" << std::endl;
+        std::cout << "or for display mode just enter the com port, e.g \nSerialLogger COM4";
         return 1;
     }
 
@@ -235,10 +295,40 @@ int wmain( int argc, wchar_t *argv[])
         std::cout << "Extra Timeout interval per write command (ms)(ms):" << timeouts.WriteTotalTimeoutConstant << std::endl;
         std::cout << std::endl;
 
+        std::cout << "About to begin logging - enter q to quit.\n\n\n";
 
         Fifo<unsigned char> dataBuffer(10 * 1024 * 1024); //10 MB
+        bool stop = false;
 
-        readData(hComm, filename, dataBuffer, linesPerTimeRecord);
+        //put around 100,000 lines in each file
+        size_t linesPerFile = (100000 / (linesPerTimeRecord + 1)) * (linesPerTimeRecord + 1);
+        if (linesPerTimeRecord == 0)
+            linesPerFile = linesPerTimeRecord + 1;
+        //split the filename into the folder and file part
+        std::wstring folder;
+        std::wstring file = filename;
+        size_t lastSlash = filename.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            folder = filename.substr(0, lastSlash + 1);
+            file = filename.substr(lastSlash + 1);
+        }
+
+        std::thread readThread(readData, hComm, &dataBuffer, linesPerTimeRecord, true, &stop);
+        std::thread writeThread(writeData, folder, file, &dataBuffer, linesPerFile, outputToScreen, &stop);
+
+        std::string input;
+        while (1)
+        {
+            std::cin >> input;
+            if (input == "q" || input == "Q")
+                break;
+            else
+                std::cout << "Unrecognised input - enter q to quit.\n\n\n";
+        }
+        stop = true;
+        readThread.join();
+        writeThread.join();
     }
     catch (std::string err)
     {
